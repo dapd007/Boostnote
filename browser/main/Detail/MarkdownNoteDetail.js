@@ -9,7 +9,6 @@ import StarButton from './StarButton'
 import TagSelect from './TagSelect'
 import FolderSelect from './FolderSelect'
 import dataApi from 'browser/main/lib/dataApi'
-import { hashHistory } from 'react-router'
 import ee from 'browser/main/lib/eventEmitter'
 import markdown from 'browser/lib/markdownTextHelper'
 import StatusBar from '../StatusBar'
@@ -30,6 +29,8 @@ import { getTodoPercentageOfCompleted } from 'browser/lib/getTodoStatus'
 import striptags from 'striptags'
 import { confirmDeleteNote } from 'browser/lib/confirmDeleteNote'
 import markdownToc from 'browser/lib/markdown-toc-generator'
+import queryString from 'query-string'
+import { replace } from 'connected-react-router'
 
 class MarkdownNoteDetail extends React.Component {
   constructor (props) {
@@ -42,9 +43,10 @@ class MarkdownNoteDetail extends React.Component {
         content: '',
         linesHighlighted: []
       }, props.note),
-      isLockButtonShown: false,
+      isLockButtonShown: props.config.editor.type !== 'SPLIT',
       isLocked: false,
-      editorType: props.config.editor.type
+      editorType: props.config.editor.type,
+      switchPreview: props.config.editor.switchPreview
     }
 
     this.dispatchTimer = null
@@ -79,6 +81,20 @@ class MarkdownNoteDetail extends React.Component {
         if (this.refs.tags) this.refs.tags.reset()
       })
     }
+
+    // Focus content if using blur or double click
+    // --> Moved here from componentDidMount so a re-render during search won't set focus to the editor
+    const {switchPreview} = nextProps.config.editor
+
+    if (this.state.switchPreview !== switchPreview) {
+      this.setState({
+        switchPreview
+      })
+      if (switchPreview === 'BLUR' || switchPreview === 'DBL_CLICK') {
+        console.log('setting focus', switchPreview)
+        this.focus()
+      }
+    }
   }
 
   componentWillUnmount () {
@@ -96,7 +112,12 @@ class MarkdownNoteDetail extends React.Component {
   handleUpdateContent () {
     const { note } = this.state
     note.content = this.refs.content.value
-    note.title = markdown.strip(striptags(findNoteTitle(note.content, this.props.config.editor.enableFrontMatterTitle, this.props.config.editor.frontMatterTitleField)))
+
+    let title = findNoteTitle(note.content, this.props.config.editor.enableFrontMatterTitle, this.props.config.editor.frontMatterTitleField)
+    title = striptags(title)
+    title = markdown.strip(title)
+    note.title = title
+
     this.updateNote(note)
   }
 
@@ -131,6 +152,7 @@ class MarkdownNoteDetail extends React.Component {
   }
 
   handleFolderChange (e) {
+    const { dispatch } = this.props
     const { note } = this.state
     const value = this.refs.folder.value
     const splitted = value.split('-')
@@ -150,12 +172,12 @@ class MarkdownNoteDetail extends React.Component {
             originNote: note,
             note: newNote
           })
-          hashHistory.replace({
+          dispatch(replace({
             pathname: location.pathname,
-            query: {
+            search: queryString.stringify({
               key: newNote.key
-            }
-          })
+            })
+          }))
           this.setState({
             isMovingNote: false
           })
@@ -190,6 +212,10 @@ class MarkdownNoteDetail extends React.Component {
 
   exportAsHtml () {
     ee.emit('export:save-html')
+  }
+
+  exportAsPdf () {
+    ee.emit('export:save-pdf')
   }
 
   handleKeyDown (e) {
@@ -285,7 +311,7 @@ class MarkdownNoteDetail extends React.Component {
   }
 
   getToggleLockButton () {
-    return this.state.isLocked ? '../resources/icon/icon-previewoff-on.svg' : '../resources/icon/icon-previewoff-off.svg'
+    return this.state.isLocked ? '../resources/icon/icon-lock.svg' : '../resources/icon/icon-unlock.svg'
   }
 
   handleDeleteKeyDown (e) {
@@ -294,7 +320,7 @@ class MarkdownNoteDetail extends React.Component {
 
   handleToggleLockButton (event, noteStatus) {
     // first argument event is not used
-    if (this.props.config.editor.switchPreview === 'BLUR' && noteStatus === 'CODE') {
+    if (noteStatus === 'CODE') {
       this.setState({isLockButtonShown: true})
     } else {
       this.setState({isLockButtonShown: false})
@@ -320,7 +346,8 @@ class MarkdownNoteDetail extends React.Component {
   }
 
   handleSwitchMode (type) {
-    this.setState({ editorType: type }, () => {
+    // If in split mode, hide the lock button
+    this.setState({ editorType: type, isLockButtonShown: !(type === 'SPLIT') }, () => {
       this.focus()
       const newConfig = Object.assign({}, this.props.config)
       newConfig.editor.type = type
@@ -365,6 +392,7 @@ class MarkdownNoteDetail extends React.Component {
         noteKey={note.key}
         linesHighlighted={note.linesHighlighted}
         onChange={this.handleUpdateContent.bind(this)}
+        isLocked={this.state.isLocked}
         ignorePreviewPointerEvents={ignorePreviewPointerEvents}
       />
     } else {
@@ -415,13 +443,14 @@ class MarkdownNoteDetail extends React.Component {
           exportAsHtml={this.exportAsHtml}
           exportAsMd={this.exportAsMd}
           exportAsTxt={this.exportAsTxt}
+          exportAsPdf={this.exportAsPdf}
         />
       </div>
     </div>
 
     const detailTopBar = <div styleName='info'>
       <div styleName='info-left'>
-        <div styleName='info-left-top'>
+        <div>
           <FolderSelect styleName='info-left-top-folderSelect'
             value={this.state.note.storage + '-' + this.state.note.folder}
             ref='folder'
@@ -455,7 +484,7 @@ class MarkdownNoteDetail extends React.Component {
               onFocus={(e) => this.handleFocus(e)}
               onMouseDown={(e) => this.handleLockButtonMouseDown(e)}
             >
-              <img styleName='iconInfo' src={imgSrc} />
+              <img src={imgSrc} />
               {this.state.isLocked ? <span styleName='tooltip'>Unlock</span> : <span styleName='tooltip'>Lock</span>}
             </button>
 
@@ -475,12 +504,13 @@ class MarkdownNoteDetail extends React.Component {
         <InfoPanel
           storageName={currentOption.storage.name}
           folderName={currentOption.folder.name}
-          noteLink={`[${note.title}](:note:${location.query.key})`}
+          noteLink={`[${note.title}](:note:${queryString.parse(location.search).key})`}
           updatedAt={formatDate(note.updatedAt)}
           createdAt={formatDate(note.createdAt)}
           exportAsMd={this.exportAsMd}
           exportAsTxt={this.exportAsTxt}
           exportAsHtml={this.exportAsHtml}
+          exportAsPdf={this.exportAsPdf}
           wordCount={note.content.split(' ').length}
           letterCount={note.content.replace(/\r?\n/g, '').length}
           type={note.type}

@@ -78,10 +78,10 @@ class MarkdownSplitEditor extends React.Component {
     e.preventDefault()
     e.stopPropagation()
     const idMatch = /checkbox-([0-9]+)/
-    const checkedMatch = /^\s*[\+\-\*] \[x\]/i
-    const uncheckedMatch = /^\s*[\+\-\*] \[ \]/
-    const checkReplace = /\[x\]/i
-    const uncheckReplace = /\[ \]/
+    const checkedMatch = /^(\s*>?)*\s*[+\-*] \[x]/i
+    const uncheckedMatch = /^(\s*>?)*\s*[+\-*] \[ ]/
+    const checkReplace = /\[x]/i
+    const uncheckReplace = /\[ ]/
     if (idMatch.test(e.target.getAttribute('id'))) {
       const lineIndex = parseInt(e.target.getAttribute('id').match(idMatch)[1], 10) - 1
       const lines = this.refs.code.value
@@ -150,7 +150,6 @@ class MarkdownSplitEditor extends React.Component {
         onMouseMove={e => this.handleMouseMove(e)}
         onMouseUp={e => this.handleMouseUp(e)}>
         <CodeEditor
-          styleName='codeEditor'
           ref='code'
           width={this.state.codeEditorWidthInPercent + '%'}
           mode='Boost Flavored Markdown'
@@ -160,6 +159,7 @@ class MarkdownSplitEditor extends React.Component {
           fontFamily={config.editor.fontFamily}
           fontSize={editorFontSize}
           displayLineNumbers={config.editor.displayLineNumbers}
+          lineWrapping
           matchingPairs={config.editor.matchingPairs}
           matchingTriples={config.editor.matchingTriples}
           explodingPairs={config.editor.explodingPairs}
@@ -179,13 +179,14 @@ class MarkdownSplitEditor extends React.Component {
           enableSmartPaste={config.editor.enableSmartPaste}
           hotkey={config.hotkey}
           switchPreview={config.editor.switchPreview}
+          enableMarkdownLint={config.editor.enableMarkdownLint}
+          customMarkdownLintConfig={config.editor.customMarkdownLintConfig}
        />
         <div styleName='slider' style={{left: this.state.codeEditorWidthInPercent + '%'}} onMouseDown={e => this.handleMouseDown(e)} >
           <div styleName='slider-hitbox' />
         </div>
         <MarkdownPreview
           style={previewStyle}
-          styleName='preview'
           theme={config.ui.theme}
           keyMap={config.editor.keyMap}
           fontSize={config.preview.fontSize}
@@ -198,6 +199,7 @@ class MarkdownSplitEditor extends React.Component {
           smartArrows={config.preview.smartArrows}
           breaks={config.preview.breaks}
           sanitize={config.preview.sanitize}
+          mermaidHTMLLabel={config.preview.mermaidHTMLLabel}
           ref='preview'
           tabInde='0'
           value={value}

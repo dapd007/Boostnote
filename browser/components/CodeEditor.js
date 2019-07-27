@@ -14,18 +14,20 @@ import {
 import TextEditorInterface from 'browser/lib/TextEditorInterface'
 import eventEmitter from 'browser/main/lib/eventEmitter'
 import iconv from 'iconv-lite'
-import crypto from 'crypto'
-import consts from 'browser/lib/consts'
+
+import { isMarkdownTitleURL } from 'browser/lib/utils'
 import styles from '../components/CodeEditor.styl'
-import fs from 'fs'
 const { ipcRenderer, remote, clipboard } = require('electron')
 import normalizeEditorFontFamily from 'browser/lib/normalizeEditorFontFamily'
 const spellcheck = require('browser/lib/spellcheck')
-const buildEditorContextMenu = require('browser/lib/contextMenuBuilder')
+const buildEditorContextMenu = require('browser/lib/contextMenuBuilder').buildEditorContextMenu
 import TurndownService from 'turndown'
-import {
-  gfm
-} from 'turndown-plugin-gfm'
+import {languageMaps} from '../lib/CMLanguageList'
+import snippetManager from '../lib/SnippetManager'
+import {generateInEditor, tocExistsInEditor} from 'browser/lib/markdown-toc-generator'
+import markdownlint from 'markdownlint'
+import Jsonlint from 'jsonlint-mod'
+import { DEFAULT_CONFIG } from '../main/lib/ConfigManager'
 
 CodeMirror.modeURL = '../node_modules/codemirror/mode/%N/%N.js'
 
@@ -36,85 +38,6 @@ const buildCMRulers = (rulers, enableRulers) =>
 
 function translateHotkey (hotkey) {
   return hotkey.replace(/\s*\+\s*/g, '-').replace(/Command/g, 'Cmd').replace(/Control/g, 'Ctrl')
-}
-
-const languageMaps = {
-  brainfuck: 'Brainfuck',
-  cpp: 'C++',
-  cs: 'C#',
-  clojure: 'Clojure',
-  'clojure-repl': 'ClojureScript',
-  cmake: 'CMake',
-  coffeescript: 'CoffeeScript',
-  crystal: 'Crystal',
-  css: 'CSS',
-  d: 'D',
-  dart: 'Dart',
-  delphi: 'Pascal',
-  diff: 'Diff',
-  django: 'Django',
-  dockerfile: 'Dockerfile',
-  ebnf: 'EBNF',
-  elm: 'Elm',
-  erlang: 'Erlang',
-  'erlang-repl': 'Erlang',
-  fortran: 'Fortran',
-  fsharp: 'F#',
-  gherkin: 'Gherkin',
-  go: 'Go',
-  groovy: 'Groovy',
-  haml: 'HAML',
-  haskell: 'Haskell',
-  haxe: 'Haxe',
-  http: 'HTTP',
-  ini: 'toml',
-  java: 'Java',
-  javascript: 'JavaScript',
-  json: 'JSON',
-  julia: 'Julia',
-  kotlin: 'Kotlin',
-  less: 'LESS',
-  livescript: 'LiveScript',
-  lua: 'Lua',
-  markdown: 'Markdown',
-  mathematica: 'Mathematica',
-  nginx: 'Nginx',
-  nsis: 'NSIS',
-  objectivec: 'Objective-C',
-  ocaml: 'Ocaml',
-  perl: 'Perl',
-  php: 'PHP',
-  powershell: 'PowerShell',
-  properties: 'Properties files',
-  protobuf: 'ProtoBuf',
-  python: 'Python',
-  puppet: 'Puppet',
-  q: 'Q',
-  r: 'R',
-  ruby: 'Ruby',
-  rust: 'Rust',
-  sas: 'SAS',
-  scala: 'Scala',
-  scheme: 'Scheme',
-  scss: 'SCSS',
-  shell: 'Shell',
-  smalltalk: 'Smalltalk',
-  sml: 'SML',
-  sql: 'SQL',
-  stylus: 'Stylus',
-  swift: 'Swift',
-  tcl: 'Tcl',
-  tex: 'LaTex',
-  typescript: 'TypeScript',
-  twig: 'Twig',
-  vbnet: 'VB.NET',
-  vbscript: 'VBScript',
-  verilog: 'Verilog',
-  vhdl: 'VHDL',
-  xml: 'HTML',
-  xquery: 'XQuery',
-  yaml: 'YAML',
-  elixir: 'Elixir'
 }
 
 export default class CodeEditor extends React.Component {
@@ -130,6 +53,7 @@ export default class CodeEditor extends React.Component {
     this.focusHandler = () => {
       ipcRenderer.send('editor:focused', true)
     }
+    const debouncedDeletionOfAttachments = _.debounce(attachmentManagement.deleteAttachmentsNotPresentInNote, 30000)
     this.blurHandler = (editor, e) => {
       ipcRenderer.send('editor:focused', false)
       if (e == null) return null
@@ -141,16 +65,11 @@ export default class CodeEditor extends React.Component {
         el = el.parentNode
       }
       this.props.onBlur != null && this.props.onBlur(e)
-
       const {
         storageKey,
         noteKey
       } = this.props
-      attachmentManagement.deleteAttachmentsNotPresentInNote(
-        this.editor.getValue(),
-        storageKey,
-        noteKey
-      )
+      debouncedDeletionOfAttachments(this.editor.getValue(), storageKey, noteKey)
     }
     this.pasteHandler = (editor, e) => {
       e.preventDefault()
@@ -163,6 +82,8 @@ export default class CodeEditor extends React.Component {
     this.searchHandler = (e, msg) => this.handleSearch(msg)
     this.searchState = null
     this.scrollToLineHandeler = this.scrollToLine.bind(this)
+    this.getCodeEditorLintConfig = this.getCodeEditorLintConfig.bind(this)
+    this.validatorOfMarkdown = this.validatorOfMarkdown.bind(this)
 
     this.formatTable = () => this.handleFormatTable()
 
@@ -228,7 +149,8 @@ export default class CodeEditor extends React.Component {
 
   updateDefaultKeyMap () {
     const { hotkey } = this.props
-    const expandSnippet = this.expandSnippet.bind(this)
+    const self = this
+    const expandSnippet = snippetManager.expandSnippet
 
     this.defaultKeyMap = CodeMirror.normalizeKeyMap({
       Tab: function (cm) {
@@ -248,14 +170,16 @@ export default class CodeEditor extends React.Component {
             }
             cm.execCommand('goLineEnd')
           } else if (
-            !charBeforeCursor.match(/\t|\s|\r|\n/) &&
+            !charBeforeCursor.match(/\t|\s|\r|\n|\$/) &&
             cursor.ch > 1
           ) {
             // text expansion on tab key if the char before is alphabet
-            const snippets = JSON.parse(
-              fs.readFileSync(consts.SNIPPET_FILE, 'utf8')
+            const wordBeforeCursor = self.getWordBeforeCursor(
+              line,
+              cursor.line,
+              cursor.ch
             )
-            if (expandSnippet(line, cursor, cm, snippets) === false) {
+            if (expandSnippet(wordBeforeCursor, cursor, cm) === false) {
               if (tabs) {
                 cm.execCommand('insertTab')
               } else {
@@ -276,6 +200,14 @@ export default class CodeEditor extends React.Component {
       },
       'Cmd-T': function (cm) {
         // Do nothing
+      },
+      [translateHotkey(hotkey.insertDate)]: function (cm) {
+        const dateNow = new Date()
+        cm.replaceSelection(dateNow.toLocaleDateString())
+      },
+      [translateHotkey(hotkey.insertDateTime)]: function (cm) {
+        const dateNow = new Date()
+        cm.replaceSelection(dateNow.toLocaleString())
       },
       Enter: 'boostNewLineAndIndentContinueMarkdownList',
       'Ctrl-C': cm => {
@@ -307,25 +239,10 @@ export default class CodeEditor extends React.Component {
   }
 
   componentDidMount () {
-    const { rulers, enableRulers } = this.props
+    const { rulers, enableRulers, enableMarkdownLint } = this.props
     eventEmitter.on('line:jump', this.scrollToLineHandeler)
 
-    const defaultSnippet = [
-      {
-        id: crypto.randomBytes(16).toString('hex'),
-        name: 'Dummy text',
-        prefix: ['lorem', 'ipsum'],
-        content: 'Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.'
-      }
-    ]
-    if (!fs.existsSync(consts.SNIPPET_FILE)) {
-      fs.writeFileSync(
-        consts.SNIPPET_FILE,
-        JSON.stringify(defaultSnippet, null, 4),
-        'utf8'
-      )
-    }
-
+    snippetManager.init()
     this.updateDefaultKeyMap()
 
     this.value = this.props.value
@@ -334,7 +251,7 @@ export default class CodeEditor extends React.Component {
       value: this.props.value,
       linesHighlighted: this.props.linesHighlighted,
       lineNumbers: this.props.displayLineNumbers,
-      lineWrapping: true,
+      lineWrapping: this.props.lineWrapping,
       theme: this.props.theme,
       indentUnit: this.props.indentSize,
       tabSize: this.props.indentSize,
@@ -344,7 +261,8 @@ export default class CodeEditor extends React.Component {
       inputStyle: 'textarea',
       dragDrop: false,
       foldGutter: true,
-      gutters: ['CodeMirror-linenumbers', 'CodeMirror-foldgutter'],
+      lint: enableMarkdownLint ? this.getCodeEditorLintConfig() : false,
+      gutters: ['CodeMirror-linenumbers', 'CodeMirror-foldgutter', 'CodeMirror-lint-markers'],
       autoCloseBrackets: {
         pairs: this.props.matchingPairs,
         triples: this.props.matchingTriples,
@@ -353,6 +271,8 @@ export default class CodeEditor extends React.Component {
       },
       extraKeys: this.defaultKeyMap
     })
+
+    document.querySelector('.CodeMirror-lint-markers').style.display = enableMarkdownLint ? 'inline-block' : 'none'
 
     if (!this.props.mode && this.props.value && this.props.autoDetect) {
       this.autoDetectLanguage(this.props.value)
@@ -520,61 +440,12 @@ export default class CodeEditor extends React.Component {
     this.initialHighlighting()
   }
 
-  expandSnippet (line, cursor, cm, snippets) {
-    const wordBeforeCursor = this.getWordBeforeCursor(
-      line,
-      cursor.line,
-      cursor.ch
-    )
-    const templateCursorString = ':{}'
-    for (let i = 0; i < snippets.length; i++) {
-      if (snippets[i].prefix.indexOf(wordBeforeCursor.text) !== -1) {
-        if (snippets[i].content.indexOf(templateCursorString) !== -1) {
-          const snippetLines = snippets[i].content.split('\n')
-          let cursorLineNumber = 0
-          let cursorLinePosition = 0
-
-          let cursorIndex
-          for (let j = 0; j < snippetLines.length; j++) {
-            cursorIndex = snippetLines[j].indexOf(templateCursorString)
-
-            if (cursorIndex !== -1) {
-              cursorLineNumber = j
-              cursorLinePosition = cursorIndex
-
-              break
-            }
-          }
-
-          cm.replaceRange(
-            snippets[i].content.replace(templateCursorString, ''),
-            wordBeforeCursor.range.from,
-            wordBeforeCursor.range.to
-          )
-          cm.setCursor({
-            line: cursor.line + cursorLineNumber,
-            ch: cursorLinePosition + cursor.ch - wordBeforeCursor.text.length
-          })
-        } else {
-          cm.replaceRange(
-            snippets[i].content,
-            wordBeforeCursor.range.from,
-            wordBeforeCursor.range.to
-          )
-        }
-        return true
-      }
-    }
-
-    return false
-  }
-
   getWordBeforeCursor (line, lineNumber, cursorPosition) {
     let wordBeforeCursor = ''
     const originCursorPosition = cursorPosition
-    const emptyChars = /\t|\s|\r|\n/
+    const emptyChars = /\t|\s|\r|\n|\$/
 
-    // to prevent the word to expand is long that will crash the whole app
+    // to prevent the word is long that will crash the whole app
     // the safeStop is there to stop user to expand words that longer than 20 chars
     const safeStop = 20
 
@@ -584,7 +455,7 @@ export default class CodeEditor extends React.Component {
       if (!emptyChars.test(currentChar)) {
         wordBeforeCursor = currentChar + wordBeforeCursor
       } else if (wordBeforeCursor.length >= safeStop) {
-        throw new Error('Your snippet trigger is too long !')
+        throw new Error('Stopped after 20 loops for safety reason !')
       } else {
         break
       }
@@ -629,7 +500,9 @@ export default class CodeEditor extends React.Component {
     let needRefresh = false
     const {
       rulers,
-      enableRulers
+      enableRulers,
+      enableMarkdownLint,
+      customMarkdownLintConfig
     } = this.props
     if (prevProps.mode !== this.props.mode) {
       this.setMode(this.props.mode)
@@ -645,6 +518,16 @@ export default class CodeEditor extends React.Component {
       needRefresh = true
     }
     if (prevProps.keyMap !== this.props.keyMap) {
+      needRefresh = true
+    }
+    if (prevProps.enableMarkdownLint !== enableMarkdownLint || prevProps.customMarkdownLintConfig !== customMarkdownLintConfig) {
+      if (!enableMarkdownLint) {
+        this.editor.setOption('lint', {default: false})
+        document.querySelector('.CodeMirror-lint-markers').style.display = 'none'
+      } else {
+        this.editor.setOption('lint', this.getCodeEditorLintConfig())
+        document.querySelector('.CodeMirror-lint-markers').style.display = 'inline-block'
+      }
       needRefresh = true
     }
 
@@ -665,6 +548,10 @@ export default class CodeEditor extends React.Component {
 
     if (prevProps.displayLineNumbers !== this.props.displayLineNumbers) {
       this.editor.setOption('lineNumbers', this.props.displayLineNumbers)
+    }
+
+    if (prevProps.lineWrapping !== this.props.lineWrapping) {
+      this.editor.setOption('lineWrapping', this.props.lineWrapping)
     }
 
     if (prevProps.scrollPastEnd !== this.props.scrollPastEnd) {
@@ -727,6 +614,56 @@ export default class CodeEditor extends React.Component {
     }
   }
 
+  getCodeEditorLintConfig () {
+    const { mode } = this.props
+    const checkMarkdownNoteIsOpen = mode === 'Boost Flavored Markdown'
+
+    return checkMarkdownNoteIsOpen ? {
+      'getAnnotations': this.validatorOfMarkdown,
+      'async': true
+    } : false
+  }
+
+  validatorOfMarkdown (text, updateLinting) {
+    const { customMarkdownLintConfig } = this.props
+    let lintConfigJson
+    try {
+      Jsonlint.parse(customMarkdownLintConfig)
+      lintConfigJson = JSON.parse(customMarkdownLintConfig)
+    } catch (err) {
+      eventEmitter.emit('APP_SETTING_ERROR')
+      return
+    }
+    const lintOptions = {
+      'strings': {
+        'content': text
+      },
+      'config': lintConfigJson
+    }
+
+    return markdownlint(lintOptions, (err, result) => {
+      if (!err) {
+        const foundIssues = []
+        const splitText = text.split('\n')
+        result.content.map(item => {
+          let ruleNames = ''
+          item.ruleNames.map((ruleName, index) => {
+            ruleNames += ruleName
+            ruleNames += (index === item.ruleNames.length - 1) ? ': ' : '/'
+          })
+          const lineNumber = item.lineNumber - 1
+          foundIssues.push({
+            from: CodeMirror.Pos(lineNumber, 0),
+            to: CodeMirror.Pos(lineNumber, splitText[lineNumber].length),
+            message: ruleNames + item.ruleDescription,
+            severity: 'warning'
+          })
+        })
+        updateLinting(foundIssues)
+      }
+    })
+  }
+
   setMode (mode) {
     let syntax = CodeMirror.findModeByName(convertModeName(mode || 'text'))
     if (syntax == null) syntax = CodeMirror.findModeByName('Plain Text')
@@ -738,6 +675,34 @@ export default class CodeEditor extends React.Component {
   handleChange (editor, changeObject) {
     spellcheck.handleChange(editor, changeObject)
 
+    // The current note contains an toc. We'll check for changes on headlines.
+    // origin is undefined when markdownTocGenerator replace the old tod
+    if (tocExistsInEditor(editor) && changeObject.origin !== undefined) {
+      let requireTocUpdate
+
+      // Check if one of the changed lines contains a headline
+      for (let line = 0; line < changeObject.text.length; line++) {
+        if (this.linePossibleContainsHeadline(editor.getLine(changeObject.from.line + line))) {
+          requireTocUpdate = true
+          break
+        }
+      }
+
+      if (!requireTocUpdate) {
+        // Check if one of the removed lines contains a headline
+        for (let line = 0; line < changeObject.removed.length; line++) {
+          if (this.linePossibleContainsHeadline(changeObject.removed[line])) {
+            requireTocUpdate = true
+            break
+          }
+        }
+      }
+
+      if (requireTocUpdate) {
+        generateInEditor(editor)
+      }
+    }
+
     this.updateHighlight(editor, changeObject)
 
     this.value = editor.getValue()
@@ -746,15 +711,21 @@ export default class CodeEditor extends React.Component {
     }
   }
 
+  linePossibleContainsHeadline (currentLine) {
+    // We can't check if the line start with # because when some write text before
+    // the # we also need to update the toc
+    return currentLine.includes('# ')
+  }
+
   incrementLines (start, linesAdded, linesRemoved, editor) {
-    let highlightedLines = editor.options.linesHighlighted
+    const highlightedLines = editor.options.linesHighlighted
 
     const totalHighlightedLines = highlightedLines.length
 
-    let offset = linesAdded - linesRemoved
+    const offset = linesAdded - linesRemoved
 
     // Store new items to be added as we're changing the lines
-    let newLines = []
+    const newLines = []
 
     let i = totalHighlightedLines
 
@@ -835,6 +806,9 @@ export default class CodeEditor extends React.Component {
       ch: 1
     }
     this.editor.setCursor(cursor)
+    const top = this.editor.charCoords({line: num, ch: 0}, 'local').top
+    const middleHeight = this.editor.getScrollerElement().offsetHeight / 2
+    this.editor.scrollTo(null, top - middleHeight - 5)
   }
 
   focus () {
@@ -888,10 +862,7 @@ export default class CodeEditor extends React.Component {
   handlePaste (editor, forceSmartPaste) {
     const { storageKey, noteKey, fetchUrlTitle, enableSmartPaste } = this.props
 
-    const isURL = str => {
-      const matcher = /^(?:\w+:)?\/\/([^\s\.]+\.\S{2}|localhost[\:?\d]*)\S*$/
-      return matcher.test(str)
-    }
+    const isURL = str => /(?:^\w+:|^)\/\/(?:[^\s\.]+\.\S{2}|localhost[\:?\d]*)/.test(str)
 
     const isInLinkTag = editor => {
       const startCursor = editor.getCursor('start')
@@ -953,6 +924,8 @@ export default class CodeEditor extends React.Component {
 
     if (isInFencedCodeBlock(editor)) {
       this.handlePasteText(editor, pastedTxt)
+    } else if (fetchUrlTitle && isMarkdownTitleURL(pastedTxt) && !isInLinkTag(editor)) {
+      this.handlePasteUrl(editor, pastedTxt)
     } else if (fetchUrlTitle && isURL(pastedTxt) && !isInLinkTag(editor)) {
       this.handlePasteUrl(editor, pastedTxt)
     } else if (attachmentManagement.isAttachmentLink(pastedTxt)) {
@@ -964,7 +937,7 @@ export default class CodeEditor extends React.Component {
     } else {
       const image = clipboard.readImage()
       if (!image.isEmpty()) {
-        attachmentManagement.handlePastNativeImage(
+        attachmentManagement.handlePasteNativeImage(
           this,
           storageKey,
           noteKey,
@@ -994,7 +967,17 @@ export default class CodeEditor extends React.Component {
   }
 
   handlePasteUrl (editor, pastedTxt) {
-    const taggedUrl = `<${pastedTxt}>`
+    let taggedUrl = `<${pastedTxt}>`
+    let urlToFetch = pastedTxt
+    let titleMark = ''
+
+    if (isMarkdownTitleURL(pastedTxt)) {
+      const pastedTxtSplitted = pastedTxt.split(' ')
+      titleMark = `${pastedTxtSplitted[0]} `
+      urlToFetch = pastedTxtSplitted[1]
+      taggedUrl = `<${urlToFetch}>`
+    }
+
     editor.replaceSelection(taggedUrl)
 
     const isImageReponse = response => {
@@ -1006,22 +989,23 @@ export default class CodeEditor extends React.Component {
     const replaceTaggedUrl = replacement => {
       const value = editor.getValue()
       const cursor = editor.getCursor()
-      const newValue = value.replace(taggedUrl, replacement)
+      const newValue = value.replace(taggedUrl, titleMark + replacement)
       const newCursor = Object.assign({}, cursor, {
-        ch: cursor.ch + newValue.length - value.length
+        ch: cursor.ch + newValue.length - (value.length - titleMark.length)
       })
+
       editor.setValue(newValue)
       editor.setCursor(newCursor)
     }
 
-    fetch(pastedTxt, {
+    fetch(urlToFetch, {
       method: 'get'
     })
       .then(response => {
         if (isImageReponse(response)) {
-          return this.mapImageResponse(response, pastedTxt)
+          return this.mapImageResponse(response, urlToFetch)
         } else {
-          return this.mapNormalResponse(response, pastedTxt)
+          return this.mapNormalResponse(response, urlToFetch)
         }
       })
       .then(replacement => {
@@ -1109,7 +1093,7 @@ export default class CodeEditor extends React.Component {
             iconv.encodingExists(_charset)
             ? _charset
             : 'utf-8'
-          resolve(iconv.decode(new Buffer(buff), charset).toString())
+          resolve(iconv.decode(Buffer.from(buff), charset).toString())
         } catch (e) {
           reject(e)
         }
@@ -1141,13 +1125,11 @@ export default class CodeEditor extends React.Component {
       }
       ref='root'
       tabIndex='-1'
-      style={
-      {
+      style={{
         fontFamily,
         fontSize: fontSize,
         width: width
-      }
-      }
+      }}
       onDrop={
         e => this.handleDropImage(e)
       }
@@ -1185,7 +1167,9 @@ CodeEditor.propTypes = {
   onChange: PropTypes.func,
   readOnly: PropTypes.bool,
   autoDetect: PropTypes.bool,
-  spellCheck: PropTypes.bool
+  spellCheck: PropTypes.bool,
+  enableMarkdownLint: PropTypes.bool,
+  customMarkdownLintConfig: PropTypes.string
 }
 
 CodeEditor.defaultProps = {
@@ -1197,5 +1181,7 @@ CodeEditor.defaultProps = {
   indentSize: 4,
   indentType: 'space',
   autoDetect: false,
-  spellCheck: false
+  spellCheck: false,
+  enableMarkdownLint: DEFAULT_CONFIG.editor.enableMarkdownLint,
+  customMarkdownLintConfig: DEFAULT_CONFIG.editor.customMarkdownLintConfig
 }
